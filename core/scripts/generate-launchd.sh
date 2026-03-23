@@ -33,13 +33,22 @@ if [[ -z "${CLAUDE_BIN}" ]]; then
 fi
 CLAUDE_DIR=$(dirname "${CLAUDE_BIN}")
 
-# Build PATH with detected dirs + standard system dirs
-LAUNCHD_PATH="${CLAUDE_DIR}:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"
+# Detect the active Node.js version (the one that will actually work with claude)
+NODE_BIN=$(which node 2>/dev/null || echo "")
+if [[ -z "${NODE_BIN}" ]]; then
+    echo "ERROR: 'node' not found in PATH. Install Node.js first." >&2
+    exit 1
+fi
+NODE_DIR=$(dirname "${NODE_BIN}")
 
-# Also include pyenv, fnm, or other version managers if present
-for extra_dir in "${HOME}/.pyenv/shims" "${HOME}/.nvm/versions/node/"*/bin; do
-    [[ -d "${extra_dir}" ]] && LAUNCHD_PATH="${extra_dir}:${LAUNCHD_PATH}"
-done
+# Build PATH with only the active node version + detected dirs + standard system dirs
+# IMPORTANT: Do NOT glob all nvm/fnm versions — only the currently active one.
+# Including multiple node versions causes unpredictable resolution and crashes
+# when an incompatible version is picked up first.
+LAUNCHD_PATH="${NODE_DIR}:${CLAUDE_DIR}:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"
+
+# Include pyenv shims if present
+[[ -d "${HOME}/.pyenv/shims" ]] && LAUNCHD_PATH="${HOME}/.pyenv/shims:${LAUNCHD_PATH}"
 
 # Generate plist
 cat > "${PLIST_FILE}" <<ENDPLIST
