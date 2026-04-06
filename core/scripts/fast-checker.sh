@@ -28,17 +28,27 @@ log() {
 }
 
 # --- Singleton: prevent duplicate fast-checker processes per agent ---
+# Use mkdir as an atomic lock (POSIX-portable, works on macOS without flock).
+# The lock dir exists for the lifetime of this process. If another instance
+# starts, mkdir fails atomically and it exits. A stale lock from a crashed
+# process is detected by checking if the recorded PID is still alive.
+LOCKDIR="${CRM_ROOT}/state/${AGENT}.fast-checker.lock"
 PIDFILE="${CRM_ROOT}/state/${AGENT}.fast-checker.pid"
 mkdir -p "${CRM_ROOT}/state"
-if [[ -f "$PIDFILE" ]]; then
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    # Lock dir exists — check if holder is still alive
     OLD_PID=$(cat "$PIDFILE" 2>/dev/null || echo "")
     if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
         log "Another fast-checker (pid ${OLD_PID}) already running for ${AGENT}. Exiting."
         exit 0
     fi
+    # Stale lock from crashed process — reclaim it
+    log "Reclaiming stale lock (old pid ${OLD_PID} is dead)"
+    rm -rf "$LOCKDIR"
+    mkdir "$LOCKDIR" 2>/dev/null || { log "Lock race lost. Exiting."; exit 0; }
 fi
 echo $$ > "$PIDFILE"
-trap 'rm -f "$PIDFILE"' EXIT
+trap 'rm -rf "$LOCKDIR"; rm -f "$PIDFILE"' EXIT
 
 log "Starting (pid $$). Waiting for agent to finish bootstrapping..."
 
@@ -81,15 +91,20 @@ AUTO_REPLY_COOLDOWN=60  # seconds between auto-replies
 HUMAN_MSG_PENDING=false
 HUMAN_MSG_CHAT_ID=""
 TYPING_LAST_SENT=0
+HUMAN_MSG_PENDING_SINCE=0  # timestamp when last human msg arrived
+
+FROZEN_RESTART_MAX_SECONDS=300  # hard-restart if agent busy for 5+ min with pending human msg
 
 # Telemetry state file (Fix 7)
 STATS_FILE="${CRM_ROOT}/state/${AGENT}.stats.json"
 
-# Check if agent is idle by looking at tmux pane
+# Check if agent is idle by looking at tmux pane.
+# NOTE: This relies on Claude Code's TUI showing a bare ">" prompt when idle.
+# If Claude Code changes its prompt UI in a future version, this regex may
+# need updating. The grep pattern is intentionally loose (allows whitespace).
 is_agent_idle() {
     local pane_bottom
     pane_bottom=$(tmux capture-pane -t "${TMUX_SESSION}:0.0" -p 2>/dev/null | grep -v '^$' | tail -3)
-    # Claude Code shows > prompt when idle, tool output/spinners when busy
     echo "$pane_bottom" | grep -qE '^\s*>\s*$'
 }
 
@@ -134,7 +149,7 @@ inject_messages() {
     grep -v '^$' "$DEDUP_FILE" 2>/dev/null | tail -100 > "${DEDUP_FILE}.tmp" 2>/dev/null && mv "${DEDUP_FILE}.tmp" "$DEDUP_FILE"
 
     local tmpfile
-    tmpfile=$(mktemp "${CRM_ROOT}/logs/${AGENT}/.crm-msg-XXXXXX.txt" 2>/dev/null) || {
+    tmpfile=$(mktemp "/tmp/.crm-msg-XXXXXX" 2>/dev/null) || {
         log "mktemp failed - skipping injection to avoid bare Enter"
         return 1
     }
@@ -230,12 +245,16 @@ while true; do
     # --- Context threshold check (every ~2 min) ---
     if (( POLL_COUNT % 120 == 0 )) && [[ "$CONTEXT_RESTART_TRIGGERED" == "false" ]]; then
         NOW_TS=$(date +%s)
-        ELAPSED_HOURS=$(( (NOW_TS - SESSION_START) / 3600 ))
+        ELAPSED_SECS=$((NOW_TS - SESSION_START))
+        ELAPSED_HOURS=$(( ELAPSED_SECS / 3600 ))
+        # Also check if we're within 1 hour of the limit using seconds comparison
+        # to avoid integer division flooring at the boundary
+        LIMIT_SECS=$((CONTEXT_MAX_HOURS * 3600))
 
         SHOULD_RESTART=false
         RESTART_REASON=""
 
-        if (( ELAPSED_HOURS >= CONTEXT_MAX_HOURS )); then
+        if (( ELAPSED_SECS >= LIMIT_SECS )); then
             SHOULD_RESTART=true
             RESTART_REASON="session running ${ELAPSED_HOURS}h (limit: ${CONTEXT_MAX_HOURS}h)"
         elif (( INJECT_COUNT >= CONTEXT_MAX_INJECTIONS )); then
@@ -248,6 +267,11 @@ while true; do
             CONTEXT_RESTART_TRIGGERED=true
             inject_messages "SYSTEM: Context threshold reached (${RESTART_REASON}). Before restarting: 1) Write a handoff file to ${CRM_ROOT}/state/${AGENT}.handoff.md with current tasks, briefings sent today, open threads, and in-progress work. 2) Notify Josh via Telegram you're restarting. 3) Run: bash ../../core/bus/hard-restart.sh --reason '${RESTART_REASON}'"
             rm -f "${SESSION_START_FILE}"
+            # Safety net: if Claude doesn't self-restart within 3 min, force it
+            ( sleep 180; if [[ "$CONTEXT_RESTART_TRIGGERED" == "true" ]]; then
+                log "CONTEXT_THRESHOLD: Claude did not self-restart in 3min — forcing hard-restart"
+                bash "${CRM_ROOT}/core/bus/hard-restart.sh" --reason "forced: context threshold not acted on (${RESTART_REASON})" &
+            fi ) &
         fi
     fi
 
@@ -269,7 +293,14 @@ while true; do
     fi
 
     # --- Telegram ---
-    TG_OUTPUT=$(bash "${BUS_DIR}/check-telegram.sh" 2>/dev/null || echo "")
+    # Capture offset from fd3 so we can commit it AFTER successful injection.
+    TG_OFFSET_FILE=$(mktemp /tmp/crm-tg-offset-XXXXXX 2>/dev/null || echo "/tmp/crm-tg-offset-$$")
+    TG_OUTPUT=$(bash "${BUS_DIR}/check-telegram.sh" 3>"$TG_OFFSET_FILE" 2>/dev/null || echo "")
+    TG_NEW_OFFSET=""
+    if [[ -f "$TG_OFFSET_FILE" ]]; then
+        TG_NEW_OFFSET=$(grep '__OFFSET__:' "$TG_OFFSET_FILE" 2>/dev/null | sed 's/__OFFSET__://' || true)
+        rm -f "$TG_OFFSET_FILE"
+    fi
     if [[ -n "$TG_OUTPUT" ]]; then
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
@@ -312,6 +343,7 @@ while true; do
 
                 # === AskUserQuestion handlers ===
                 ASK_STATE="/tmp/crm-ask-state-${AGENT}.json"
+
                 # Single-select: askopt_{questionIdx}_{optionIdx}
                 if [[ "$DATA" =~ ^askopt_([0-9]+)_([0-9]+)$ ]]; then
                     Q_IDX="${BASH_REMATCH[1]}"
@@ -444,6 +476,26 @@ message_id: ${MSG_ID}
 Reply using: bash ../../core/bus/send-telegram.sh ${CHAT_ID} \"<your reply>\"
 
 "
+            elif [[ "$TYPE" == "document" ]]; then
+                DOC_PATH=$(echo "$line" | jq -r '.file_path // ""' 2>/dev/null || echo "")
+                DOC_NAME=$(echo "$line" | jq -r '.file_name // "document"' 2>/dev/null || echo "document")
+                # Auto-reply when agent is busy processing
+                if ! is_agent_idle; then
+                    auto_reply_busy "${CHAT_ID}"
+                fi
+                HUMAN_MSG_PENDING=true
+                HUMAN_MSG_CHAT_ID="${CHAT_ID}"
+                HUMAN_MSG_PENDING_SINCE=$(date +%s)
+                MESSAGE_BLOCK+="=== TELEGRAM DOCUMENT from ${FROM} (chat_id:${CHAT_ID}) ===
+file_name: ${DOC_NAME}
+caption:
+\`\`\`
+${TEXT}
+\`\`\`
+local_file: ${DOC_PATH}
+Reply using: bash ../../core/bus/send-telegram.sh ${CHAT_ID} \"<your reply>\"
+
+"
             elif [[ "$TYPE" == "photo" ]]; then
                 IMAGE_PATH=$(echo "$line" | jq -r '.image_path // ""' 2>/dev/null || echo "")
                 MESSAGE_BLOCK+="=== TELEGRAM PHOTO from ${FROM} (chat_id:${CHAT_ID}) ===
@@ -517,6 +569,7 @@ Agent: ${IDLE_STR}"
                     # Track human message for typing indicator (Fix 9)
                     HUMAN_MSG_PENDING=true
                     HUMAN_MSG_CHAT_ID="${CHAT_ID}"
+                    HUMAN_MSG_PENDING_SINCE=$(date +%s)
                     REPLY_CONTEXT=""
                     [[ -n "$REPLY_TO_TEXT" ]] && REPLY_CONTEXT="
 In reply to: \"${REPLY_TO_TEXT}\""
@@ -566,6 +619,13 @@ Reply using: bash ../../core/bus/send-message.sh ${FROM} normal '<your reply>' $
 
     # --- Inject if anything found ---
     if [[ -n "$MESSAGE_BLOCK" ]]; then
+        # Commit Telegram offset immediately — dedup hash prevents re-injection on retry
+        if [[ -n "$TG_NEW_OFFSET" ]]; then
+            OFFSET_STATE_FILE="${CRM_ROOT}/state/.telegram-offset-${AGENT}"
+            echo "$TG_NEW_OFFSET" > "$OFFSET_STATE_FILE"
+            log "Committed Telegram offset: ${TG_NEW_OFFSET}"
+            TG_NEW_OFFSET=""  # clear so the else-branch below doesn't double-commit
+        fi
         if inject_messages "$MESSAGE_BLOCK"; then
             INJECT_COUNT=$((INJECT_COUNT + 1))
             for ack_id in "${INBOX_MSG_IDS[@]+"${INBOX_MSG_IDS[@]}"}"; do
@@ -573,7 +633,59 @@ Reply using: bash ../../core/bus/send-message.sh ${FROM} normal '<your reply>' $
             done
             # Cooldown after injection
             sleep 5
+        else
+            log "Injection failed — offset already committed, dedup hash will prevent re-injection"
         fi
+    else
+        # No messages but offset may need advancing (e.g. filtered-out updates from non-allowed users)
+        if [[ -n "$TG_NEW_OFFSET" ]]; then
+            OFFSET_STATE_FILE="${CRM_ROOT}/state/.telegram-offset-${AGENT}"
+            echo "$TG_NEW_OFFSET" > "$OFFSET_STATE_FILE"
+        fi
+    fi
+
+    # --- Typing indicator while agent processes human message (Fix 9) ---
+    if [[ "$HUMAN_MSG_PENDING" == "true" ]]; then
+        if ! is_agent_idle; then
+            NOW_TS=$(date +%s)
+            if (( NOW_TS - TYPING_LAST_SENT >= 5 )); then
+                telegram_api_post "sendChatAction" \
+                    -H "Content-Type: application/json" \
+                    -d "$(jq -n -c --arg cid "$HUMAN_MSG_CHAT_ID" '{chat_id: $cid, action: "typing"}')" \
+                    > /dev/null 2>&1 || true
+                TYPING_LAST_SENT=$NOW_TS
+            fi
+            # Frozen detection: if agent has been "busy" for too long, hard-restart
+            PENDING_AGE=$(( NOW_TS - HUMAN_MSG_PENDING_SINCE ))
+            if (( HUMAN_MSG_PENDING_SINCE > 0 && PENDING_AGE >= FROZEN_RESTART_MAX_SECONDS )); then
+                log "FROZEN DETECTED: agent busy for ${PENDING_AGE}s with unhandled human msg — hard-restarting"
+                telegram_api_post "sendMessage" \
+                    -H "Content-Type: application/json" \
+                    -d "$(jq -n -c --arg cid "$HUMAN_MSG_CHAT_ID" --arg txt "Looks like I got stuck. Restarting now..." \
+                        '{chat_id: $cid, text: $txt}')" > /dev/null 2>&1 || true
+                HUMAN_MSG_PENDING=false
+                HUMAN_MSG_PENDING_SINCE=0
+                bash "${CRM_ROOT}/core/bus/hard-restart.sh" --reason "frozen: agent busy ${PENDING_AGE}s with unhandled message" &
+            fi
+        else
+            HUMAN_MSG_PENDING=false
+            HUMAN_MSG_PENDING_SINCE=0
+        fi
+    fi
+
+    # --- Health telemetry (Fix 7) — write stats every ~5 min ---
+    if (( POLL_COUNT % 300 == 0 )); then
+        NOW_TS=$(date +%s)
+        jq -n -c \
+            --argjson uptime "$((NOW_TS - SESSION_START))" \
+            --argjson inject_count "$INJECT_COUNT" \
+            --argjson inject_limit "$CONTEXT_MAX_INJECTIONS" \
+            --argjson hours_limit "$CONTEXT_MAX_HOURS" \
+            --argjson poll_count "$POLL_COUNT" \
+            --arg last_check "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg agent_state "$(is_agent_idle && echo idle || echo busy)" \
+            '{uptime_s: $uptime, injects: $inject_count, inject_limit: $inject_limit, hours_limit: $hours_limit, polls: $poll_count, checked: $last_check, agent: $agent_state}' \
+            > "${STATS_FILE}" 2>/dev/null
     fi
 
     # --- Typing indicator while agent processes human message (Fix 9) ---

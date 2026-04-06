@@ -50,6 +50,17 @@ fi
 MESSAGES=$(echo "${RESPONSE}" | jq --arg uid "${ALLOWED_USER}" \
     '[.result[] | select(.message.from.id == ($uid | tonumber) or .callback_query.from.id == ($uid | tonumber))]')
 
+# Calculate new offset but DON'T write it yet.
+# The caller (fast-checker.sh) writes it AFTER successful injection
+# so messages aren't lost if the process dies between poll and inject.
+NEW_OFFSET=$(echo "${RESPONSE}" | jq '.result[-1].update_id + 1 // empty')
+
+# Output new offset on fd3 so caller can commit it after successful injection.
+# Falls back to stderr if fd3 not open.
+if [[ -n "${NEW_OFFSET}" ]]; then
+    echo "__OFFSET__:${NEW_OFFSET}" >&3 2>/dev/null || echo "__OFFSET__:${NEW_OFFSET}" >&2 2>/dev/null || true
+fi
+
 MSG_COUNT=$(echo "${MESSAGES}" | jq 'length')
 
 IMAGE_DIR="${TELEGRAM_IMAGE_DIR:-${TEMPLATE_ROOT}/agents/${ME}/telegram-images}"
@@ -99,20 +110,23 @@ if [[ "${MSG_COUNT}" -gt 0 ]]; then
         file_id: (.message.photo | last | .file_id)
     }')
 
-    # Handle document messages: download and output with local path
+    # Handle document/file messages: download and output with local path
+    DOC_DIR="${TEMPLATE_ROOT}/agents/${ME}/telegram-docs"
+    mkdir -p "${DOC_DIR}"
     while IFS= read -r doc_msg; do
+        [[ -z "$doc_msg" ]] && continue
         CHAT_ID_VAL=$(echo "${doc_msg}" | jq -r '.chat_id')
         FROM_VAL=$(echo "${doc_msg}" | jq -r '.from')
         DATE_VAL=$(echo "${doc_msg}" | jq -r '.date')
         CAPTION_VAL=$(echo "${doc_msg}" | jq -r '.caption // ""')
         FILE_ID=$(echo "${doc_msg}" | jq -r '.file_id')
-        FILE_NAME=$(echo "${doc_msg}" | jq -r '.file_name')
+        FILE_NAME=$(echo "${doc_msg}" | jq -r '.file_name // "document"')
 
         FILE_RESPONSE=$(telegram_api_get "getFile?file_id=${FILE_ID}" 2>/dev/null || echo '{"ok":false}')
         FILE_PATH=$(echo "${FILE_RESPONSE}" | jq -r '.result.file_path // empty')
 
         if [[ -n "${FILE_PATH}" ]]; then
-            LOCAL_FILE="${IMAGE_DIR}/${FILE_NAME}"
+            LOCAL_FILE="${DOC_DIR}/${DATE_VAL}_${FILE_NAME}"
             telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null || true
 
             jq -nc \
@@ -230,11 +244,4 @@ if [[ "${MSG_COUNT}" -gt 0 ]]; then
         date: .callback_query.message.date,
         type: "callback"
     }'
-fi
-
-# Update offset AFTER all messages have been output
-# This prevents silent message loss if the script crashes mid-output
-NEW_OFFSET=$(echo "${RESPONSE}" | jq '.result[-1].update_id + 1 // empty')
-if [[ -n "${NEW_OFFSET}" ]]; then
-    echo "${NEW_OFFSET}" > "${OFFSET_FILE}"
 fi
