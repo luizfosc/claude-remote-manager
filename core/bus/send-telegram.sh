@@ -95,12 +95,25 @@ fi
 if echo "${RESPONSE}" | jq -e '.ok' > /dev/null 2>&1; then
     echo "${RESPONSE}" | jq -r '.result.message_id'
 else
-    # Markdown failures (Bad Request) are recoverable — resend as plain text
+    # Markdown failures (Bad Request) are recoverable — resend without parse_mode
     ERROR_DESC=$(echo "${RESPONSE}" | jq -r '.description // ""' 2>/dev/null)
     if [[ "$ERROR_DESC" == *"can't parse"* || "$ERROR_DESC" == *"Bad Request"* ]]; then
-        RESPONSE=$(telegram_api_post "sendMessage" \
-            -d chat_id="${CHAT_ID}" \
-            --data-urlencode "text=${MESSAGE}")
+        # Retry preserving reply_markup (inline keyboards) if present
+        if [[ -n "${KEYBOARD}" ]]; then
+            KEYBOARD_VALID=$(echo "${KEYBOARD}" | jq -c '.' 2>/dev/null || echo '{"inline_keyboard":[]}')
+            FALLBACK_PAYLOAD=$(jq -n -c \
+                --argjson chat_id "${CHAT_ID}" \
+                --arg text "${MESSAGE}" \
+                --argjson markup "${KEYBOARD_VALID}" \
+                '{chat_id: $chat_id, text: $text, reply_markup: $markup}')
+            RESPONSE=$(telegram_api_post "sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "${FALLBACK_PAYLOAD}")
+        else
+            RESPONSE=$(telegram_api_post "sendMessage" \
+                -d chat_id="${CHAT_ID}" \
+                --data-urlencode "text=${MESSAGE}")
+        fi
         if echo "${RESPONSE}" | jq -e '.ok' > /dev/null 2>&1; then
             echo "${RESPONSE}" | jq -r '.result.message_id'
         else

@@ -43,31 +43,7 @@ if [[ "${RESTART}" != "true" ]]; then
     fi
 fi
 
-echo "========================================="
-echo "  Enabling: ${AGENT}"
-echo "========================================="
-echo ""
-
-if [[ "${RESTART}" == "true" ]]; then
-    echo "Restarting ${AGENT}..."
-
-    # Reset crash counter
-    rm -f "${CRM_ROOT}/logs/${AGENT}/.crash_count_today"
-
-    # Reload launchd
-    PLIST="${HOME}/Library/LaunchAgents/com.claude-remote.${CRM_INSTANCE_ID}.${AGENT}.plist"
-    if [[ -f "${PLIST}" ]]; then
-        launchctl unload "${PLIST}" 2>/dev/null || true
-        launchctl load "${PLIST}"
-        echo "${AGENT} restarted."
-    else
-        echo "No launchd plist found. Running full setup..."
-        "${TEMPLATE_ROOT}/core/scripts/generate-launchd.sh" "${AGENT}"
-    fi
-    exit 0
-fi
-
-# --- Token conflict detection ---
+# --- Token conflict detection (runs for BOTH enable and restart) ---
 # Prevent two enabled agents from polling the same Telegram bot token,
 # which causes duplicate message processing and disconnections.
 ENV_FILE_CHECK="${AGENT_DIR}/.env"
@@ -91,6 +67,30 @@ if [[ -f "${ENV_FILE_CHECK}" ]]; then
             fi
         done
     fi
+fi
+
+echo "========================================="
+echo "  Enabling: ${AGENT}"
+echo "========================================="
+echo ""
+
+if [[ "${RESTART}" == "true" ]]; then
+    echo "Restarting ${AGENT}..."
+
+    # Reset crash counter
+    rm -f "${CRM_ROOT}/logs/${AGENT}/.crash_count_today"
+
+    # Reload launchd
+    PLIST="${HOME}/Library/LaunchAgents/com.claude-remote.${CRM_INSTANCE_ID}.${AGENT}.plist"
+    if [[ -f "${PLIST}" ]]; then
+        launchctl unload "${PLIST}" 2>/dev/null || true
+        launchctl load "${PLIST}"
+        echo "${AGENT} restarted."
+    else
+        echo "No launchd plist found. Running full setup..."
+        "${TEMPLATE_ROOT}/core/scripts/generate-launchd.sh" "${AGENT}"
+    fi
+    exit 0
 fi
 
 # Set environment for the agent
