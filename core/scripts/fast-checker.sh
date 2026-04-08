@@ -96,11 +96,12 @@ HUMAN_MSG_CHAT_ID=""
 TYPING_LAST_SENT=0
 HUMAN_MSG_PENDING_SINCE=0  # timestamp when last human msg arrived
 
-FROZEN_SOFT_NUDGE_SECONDS=120   # soft nudge (Ctrl+C + re-prompt) after 2 min
-FROZEN_RESTART_MAX_SECONDS=300  # hard-restart if agent busy for 5+ min with pending human msg
+FROZEN_SOFT_NUDGE_SECONDS=$(jq -r '.frozen_soft_nudge_seconds // 600' "${AGENT_DIR}/config.json" 2>/dev/null || echo "600")   # soft nudge after 10 min (configurable)
+FROZEN_RESTART_MAX_SECONDS=$(jq -r '.frozen_restart_max_seconds // 900' "${AGENT_DIR}/config.json" 2>/dev/null || echo "900")  # hard-restart after 15 min (configurable)
 FROZEN_NUDGE_SENT=0             # track whether we already sent a soft nudge (0=no, 1=yes)
-LAST_PANE_HASH=""               # track pane content changes for progress detection
+ACTIVE_PANE_HASH=""             # track pane content changes for active frozen detection
 PANE_STALE_SINCE=0              # when pane content stopped changing
+PASSIVE_PANE_HASH=""           # separate hash for passive frozen detection
 PANE_UNCHANGED_SINCE=0         # for passive frozen detection
 PASSIVE_FROZEN_THRESHOLD=600   # 10 min of zero pane change while busy = frozen
 PASSIVE_FROZEN_TRIGGERED=false
@@ -129,6 +130,7 @@ do_hard_restart() {
             mkdir -p "${CRM_ROOT}/state"
             touch "${CRM_ROOT}/state/${AGENT}.force-fresh"
             rm -f "${CRM_ROOT}/state/${AGENT}.session-start"
+            rm -f "${CRM_ROOT}/state/${AGENT}.dedup"
             nohup bash -c "sleep 10 && launchctl unload '${plist}' 2>/dev/null; sleep 1 && launchctl load '${plist}'" \
                 >> "${CRM_ROOT}/logs/${AGENT}/restarts.log" 2>&1 &
             disown
@@ -260,7 +262,7 @@ inject_messages() {
     fi
     if [[ -f "$DEDUP_FILE" ]] && grep -qxF "$msg_hash" "$DEDUP_FILE" 2>/dev/null; then
         log "Dedup: skipping duplicate (hash: ${msg_hash:0:8})"
-        return 0
+        return 10  # dedup-skipped — distinct from success (0) and failure (1)
     fi
     echo "$msg_hash" >> "$DEDUP_FILE"
     # Clean dedup file and remove any empty lines
@@ -600,10 +602,7 @@ Reply using: bash ../../core/bus/send-telegram.sh ${CHAT_ID} \"<your reply>\"
             elif [[ "$TYPE" == "document" ]]; then
                 DOC_PATH=$(echo "$line" | jq -r '.file_path // ""' 2>/dev/null || echo "")
                 DOC_NAME=$(echo "$line" | jq -r '.file_name // "document"' 2>/dev/null || echo "document")
-                # Auto-reply when agent is busy processing
-                if ! is_agent_idle; then
-                    auto_reply_busy "${CHAT_ID}"
-                fi
+                PENDING_BUSY_ACK_CHAT_ID="${CHAT_ID}"
                 HUMAN_MSG_PENDING=true
                 HUMAN_MSG_CHAT_ID="${CHAT_ID}"
                 HUMAN_MSG_PENDING_SINCE=$(date +%s)
@@ -619,6 +618,10 @@ Reply using: bash ../../core/bus/send-telegram.sh ${CHAT_ID} \"<your reply>\"
 "
             elif [[ "$TYPE" == "photo" ]]; then
                 IMAGE_PATH=$(echo "$line" | jq -r '.image_path // ""' 2>/dev/null || echo "")
+                PENDING_BUSY_ACK_CHAT_ID="${CHAT_ID}"
+                HUMAN_MSG_PENDING=true
+                HUMAN_MSG_CHAT_ID="${CHAT_ID}"
+                HUMAN_MSG_PENDING_SINCE=$(date +%s)
                 MESSAGE_BLOCK+="=== TELEGRAM PHOTO from ${FROM} (chat_id:${CHAT_ID}) ===
 caption:
 \`\`\`
@@ -628,22 +631,13 @@ local_file: ${IMAGE_PATH}
 Reply using: bash ../../core/bus/send-telegram.sh ${CHAT_ID} \"<your reply>\"
 
 "
-            elif [[ "$TYPE" == "document" ]]; then
-                DOC_PATH=$(echo "$line" | jq -r '.file_path // ""' 2>/dev/null || echo "")
-                DOC_NAME=$(echo "$line" | jq -r '.file_name // ""' 2>/dev/null || echo "")
-                MESSAGE_BLOCK+="=== TELEGRAM DOCUMENT from ${FROM} (chat_id:${CHAT_ID}) ===
-caption:
-\`\`\`
-${TEXT}
-\`\`\`
-local_file: ${DOC_PATH}
-file_name: ${DOC_NAME}
-Reply using: bash ../../core/bus/send-telegram.sh ${CHAT_ID} \"<your reply>\"
-
-"
             elif [[ "$TYPE" == "voice" || "$TYPE" == "audio" ]]; then
                 AUDIO_PATH=$(echo "$line" | jq -r '.file_path // ""' 2>/dev/null || echo "")
                 AUDIO_NAME=$(echo "$line" | jq -r '.file_name // ""' 2>/dev/null || echo "")
+                PENDING_BUSY_ACK_CHAT_ID="${CHAT_ID}"
+                HUMAN_MSG_PENDING=true
+                HUMAN_MSG_CHAT_ID="${CHAT_ID}"
+                HUMAN_MSG_PENDING_SINCE=$(date +%s)
                 MESSAGE_BLOCK+="=== TELEGRAM ${TYPE^^} from ${FROM} (chat_id:${CHAT_ID}) ===
 local_file: ${AUDIO_PATH}
 file_name: ${AUDIO_NAME}
@@ -652,6 +646,10 @@ Reply using: bash ../../core/bus/send-telegram.sh ${CHAT_ID} \"<your reply>\"
 "
             elif [[ "$TYPE" == "video_note" ]]; then
                 VIDEO_PATH=$(echo "$line" | jq -r '.file_path // ""' 2>/dev/null || echo "")
+                PENDING_BUSY_ACK_CHAT_ID="${CHAT_ID}"
+                HUMAN_MSG_PENDING=true
+                HUMAN_MSG_CHAT_ID="${CHAT_ID}"
+                HUMAN_MSG_PENDING_SINCE=$(date +%s)
                 MESSAGE_BLOCK+="=== TELEGRAM VIDEO NOTE from ${FROM} (chat_id:${CHAT_ID}) ===
 local_file: ${VIDEO_PATH}
 Reply using: bash ../../core/bus/send-telegram.sh ${CHAT_ID} \"<your reply>\"
@@ -683,10 +681,7 @@ Agent: ${IDLE_STR}"
                     MESSAGE_BLOCK+="${TEXT}
 "
                 else
-                    # Auto-reply when agent is busy processing
-                    if ! is_agent_idle; then
-                        auto_reply_busy "${CHAT_ID}"
-                    fi
+                    PENDING_BUSY_ACK_CHAT_ID="${CHAT_ID}"
                     # Track human message for typing indicator (Fix 9)
                     HUMAN_MSG_PENDING=true
                     HUMAN_MSG_CHAT_ID="${CHAT_ID}"
@@ -740,8 +735,16 @@ Reply using: bash ../../core/bus/send-message.sh ${FROM} normal '<your reply>' $
 
     # --- Inject if anything found ---
     if [[ -n "$MESSAGE_BLOCK" ]]; then
-        if inject_messages "$MESSAGE_BLOCK"; then
+        inject_messages "$MESSAGE_BLOCK"
+        inject_status=$?
+        if [[ $inject_status -eq 0 ]]; then
+            # Real injection succeeded
             INJECT_COUNT=$((INJECT_COUNT + 1))
+            # Send auto-reply AFTER successful injection (not before dedup)
+            if [[ -n "${PENDING_BUSY_ACK_CHAT_ID:-}" ]] && ! is_agent_idle; then
+                auto_reply_busy "$PENDING_BUSY_ACK_CHAT_ID"
+            fi
+            PENDING_BUSY_ACK_CHAT_ID=""
             # Commit Telegram offset ONLY after successful injection
             if [[ -n "$TG_NEW_OFFSET" ]]; then
                 OFFSET_STATE_FILE="${CRM_ROOT}/state/.telegram-offset-${AGENT}"
@@ -754,8 +757,20 @@ Reply using: bash ../../core/bus/send-message.sh ${FROM} normal '<your reply>' $
             done
             # Cooldown after injection
             sleep 5
+        elif [[ $inject_status -eq 10 ]]; then
+            # Dedup-skipped — message was a duplicate, silently advance offset
+            log "Dedup-skipped — advancing offset without injection or auto-reply"
+            PENDING_BUSY_ACK_CHAT_ID=""
+            HUMAN_MSG_PENDING=false
+            HUMAN_MSG_PENDING_SINCE=0
+            if [[ -n "$TG_NEW_OFFSET" ]]; then
+                OFFSET_STATE_FILE="${CRM_ROOT}/state/.telegram-offset-${AGENT}"
+                echo "$TG_NEW_OFFSET" > "$OFFSET_STATE_FILE"
+                TG_NEW_OFFSET=""
+            fi
         else
             log "Injection deferred — NOT advancing Telegram offset (will retry next poll)"
+            PENDING_BUSY_ACK_CHAT_ID=""
         fi
     else
         # No messages but offset may need advancing (e.g. filtered-out updates from non-allowed users)
@@ -790,10 +805,10 @@ Reply using: bash ../../core/bus/send-message.sh ${FROM} normal '<your reply>' $
             fi
             # Progress detection: hash tmux pane to see if agent is making progress
             CURRENT_PANE=$(tmux capture-pane -t "${TMUX_SESSION}:0.0" -p 2>/dev/null | tail -10)
-            CURRENT_HASH=$(printf '%s' "$CURRENT_PANE" | shasum 2>/dev/null | cut -d' ' -f1 || echo "")
-            if [[ "$CURRENT_HASH" != "$LAST_PANE_HASH" ]]; then
+            CURRENT_HASH=$(printf '%s' "$CURRENT_PANE" | shasum -a 256 2>/dev/null | cut -d' ' -f1 || echo "")
+            if [[ "$CURRENT_HASH" != "$ACTIVE_PANE_HASH" ]]; then
                 # Agent is making progress — reset stale timer
-                LAST_PANE_HASH="$CURRENT_HASH"
+                ACTIVE_PANE_HASH="$CURRENT_HASH"
                 PANE_STALE_SINCE=$NOW_TS
             fi
             # Only check frozen if pane has been stale (no progress)
@@ -826,7 +841,7 @@ Reply using: bash ../../core/bus/send-message.sh ${FROM} normal '<your reply>' $
             HUMAN_MSG_PENDING=false
             HUMAN_MSG_PENDING_SINCE=0
             FROZEN_NUDGE_SENT=0
-            LAST_PANE_HASH=""
+            ACTIVE_PANE_HASH=""
             PANE_STALE_SINCE=0
             LAST_ACTIVITY=""
         fi
@@ -838,8 +853,8 @@ Reply using: bash ../../core/bus/send-message.sh ${FROM} normal '<your reply>' $
         CURRENT_PANE_HASH=$(printf '%s' "$CURRENT_PANE" | shasum -a 256 2>/dev/null | cut -d' ' -f1)
         NOW_TS=$(date +%s)
 
-        if [[ "$CURRENT_PANE_HASH" != "$LAST_PANE_HASH" ]]; then
-            LAST_PANE_HASH="$CURRENT_PANE_HASH"
+        if [[ "$CURRENT_PANE_HASH" != "$PASSIVE_PANE_HASH" ]]; then
+            PASSIVE_PANE_HASH="$CURRENT_PANE_HASH"
             PANE_UNCHANGED_SINCE=$NOW_TS
             PASSIVE_FROZEN_TRIGGERED=false
         elif [[ "$PASSIVE_FROZEN_TRIGGERED" == "false" ]] && (( PANE_UNCHANGED_SINCE > 0 )); then

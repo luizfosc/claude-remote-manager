@@ -41,6 +41,9 @@ touch "${CRM_ROOT}/state/${AGENT}.force-fresh"
 # Clear context tracking state so new session starts fresh
 rm -f "${CRM_ROOT}/state/${AGENT}.session-start"
 
+# Clear dedup state so messages aren't silently dropped after restart
+rm -f "${CRM_ROOT}/state/${AGENT}.dedup"
+
 # Detach a subprocess to perform the restart after a short delay
 nohup bash -c "sleep 10 && launchctl unload '${PLIST}' 2>/dev/null; sleep 1 && launchctl load '${PLIST}'" \
     >> "${LOG_DIR}/restarts.log" 2>&1 &

@@ -304,8 +304,9 @@ trap graceful_shutdown SIGTERM SIGINT
             fi
 
             # Kill old fast-checker and start fresh one
-            # Remove PID lock so the new instance can acquire it
+            # Remove PID lock and stale dedup so the new instance starts clean
             rm -f "${CRM_ROOT}/state/${AGENT}.fast-checker.pid"
+            rm -f "${CRM_ROOT}/state/${AGENT}.dedup"
             rm -rf "${CRM_ROOT}/state/${AGENT}.fast-checker.lock"
             pkill -f "fast-checker.sh ${AGENT} " 2>/dev/null || true
             sleep 1
@@ -328,6 +329,7 @@ TIMER_PID=$!
 
 # Kill any stale fast-checker for this agent before starting a fresh one.
 rm -f "${CRM_ROOT}/state/${AGENT}.fast-checker.pid"
+rm -f "${CRM_ROOT}/state/${AGENT}.dedup"
 pkill -f "fast-checker.sh ${AGENT} " 2>/dev/null || true
 
 # Start fast message checker (Telegram + inbox polling every 3s)
