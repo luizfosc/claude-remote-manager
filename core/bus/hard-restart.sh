@@ -44,6 +44,9 @@ rm -f "${CRM_ROOT}/state/${AGENT}.session-start"
 # Clear dedup state so messages aren't silently dropped after restart
 rm -f "${CRM_ROOT}/state/${AGENT}.dedup"
 
+# Clear context-restart marker so the safety net subshell doesn't double-restart
+rm -f "${CRM_ROOT}/state/${AGENT}.context-restart-pending"
+
 # Detach a subprocess to perform the restart after a short delay
 nohup bash -c "sleep 10 && launchctl unload '${PLIST}' 2>/dev/null; sleep 1 && launchctl load '${PLIST}'" \
     >> "${LOG_DIR}/restarts.log" 2>&1 &

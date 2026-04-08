@@ -92,15 +92,23 @@ if [[ "${MSG_COUNT}" -gt 0 ]]; then
             # Use unique suffix from file_path to prevent overwrite in media groups
             UNIQUE_SUFFIX=$(echo "${FILE_PATH}" | sed 's|.*/||;s|\..*||' | tail -c 12)
             LOCAL_FILE="${IMAGE_DIR}/${DATE_VAL}_${UNIQUE_SUFFIX}.jpg"
-            telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null || true
-
-            jq -nc \
-                --arg chat_id "${CHAT_ID_VAL}" \
-                --arg from "${FROM_VAL}" \
-                --arg caption "${CAPTION_VAL}" \
-                --argjson date "${DATE_VAL}" \
-                --arg image_path "${LOCAL_FILE}" \
-                '{chat_id: ($chat_id | tonumber), from: $from, text: $caption, image_path: $image_path, date: $date, type: "photo"}'
+            if telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null && [[ -s "${LOCAL_FILE}" ]]; then
+                jq -nc \
+                    --arg chat_id "${CHAT_ID_VAL}" \
+                    --arg from "${FROM_VAL}" \
+                    --arg caption "${CAPTION_VAL}" \
+                    --argjson date "${DATE_VAL}" \
+                    --arg image_path "${LOCAL_FILE}" \
+                    '{chat_id: ($chat_id | tonumber), from: $from, text: $caption, image_path: $image_path, date: $date, type: "photo"}'
+            else
+                # Download failed — emit error type so offset is NOT committed
+                rm -f "${LOCAL_FILE}"
+                jq -nc \
+                    --arg chat_id "${CHAT_ID_VAL}" \
+                    --arg from "${FROM_VAL}" \
+                    --argjson date "${DATE_VAL}" \
+                    '{chat_id: ($chat_id | tonumber), from: $from, text: "[photo download failed — will retry]", date: $date, type: "download_error"}'
+            fi
         fi
     done < <(echo "${MESSAGES}" | jq -c '.[] | select(.message.photo) | {
         chat_id: .message.chat.id,
@@ -127,16 +135,24 @@ if [[ "${MSG_COUNT}" -gt 0 ]]; then
 
         if [[ -n "${FILE_PATH}" ]]; then
             LOCAL_FILE="${DOC_DIR}/${DATE_VAL}_${FILE_NAME}"
-            telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null || true
-
-            jq -nc \
-                --arg chat_id "${CHAT_ID_VAL}" \
-                --arg from "${FROM_VAL}" \
-                --arg caption "${CAPTION_VAL}" \
-                --argjson date "${DATE_VAL}" \
-                --arg file_path "${LOCAL_FILE}" \
-                --arg file_name "${FILE_NAME}" \
-                '{chat_id: ($chat_id | tonumber), from: $from, text: $caption, file_path: $file_path, file_name: $file_name, date: $date, type: "document"}'
+            if telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null && [[ -s "${LOCAL_FILE}" ]]; then
+                jq -nc \
+                    --arg chat_id "${CHAT_ID_VAL}" \
+                    --arg from "${FROM_VAL}" \
+                    --arg caption "${CAPTION_VAL}" \
+                    --argjson date "${DATE_VAL}" \
+                    --arg file_path "${LOCAL_FILE}" \
+                    --arg file_name "${FILE_NAME}" \
+                    '{chat_id: ($chat_id | tonumber), from: $from, text: $caption, file_path: $file_path, file_name: $file_name, date: $date, type: "document"}'
+            else
+                rm -f "${LOCAL_FILE}"
+                jq -nc \
+                    --arg chat_id "${CHAT_ID_VAL}" \
+                    --arg from "${FROM_VAL}" \
+                    --argjson date "${DATE_VAL}" \
+                    --arg file_name "${FILE_NAME}" \
+                    '{chat_id: ($chat_id | tonumber), from: $from, text: "[document download failed — will retry]", file_name: $file_name, date: $date, type: "download_error"}'
+            fi
         fi
     done < <(echo "${MESSAGES}" | jq -c '.[] | select(.message.document) | {
         chat_id: .message.chat.id,
@@ -160,15 +176,22 @@ if [[ "${MSG_COUNT}" -gt 0 ]]; then
 
         if [[ -n "${FILE_PATH}" ]]; then
             LOCAL_FILE="${IMAGE_DIR}/${FILE_NAME}"
-            telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null || true
-
-            jq -nc \
-                --arg chat_id "${CHAT_ID_VAL}" \
-                --arg from "${FROM_VAL}" \
-                --argjson date "${DATE_VAL}" \
-                --arg file_path "${LOCAL_FILE}" \
-                --arg file_name "${FILE_NAME}" \
-                '{chat_id: ($chat_id | tonumber), from: $from, text: "", file_path: $file_path, file_name: $file_name, date: $date, type: "audio"}'
+            if telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null && [[ -s "${LOCAL_FILE}" ]]; then
+                jq -nc \
+                    --arg chat_id "${CHAT_ID_VAL}" \
+                    --arg from "${FROM_VAL}" \
+                    --argjson date "${DATE_VAL}" \
+                    --arg file_path "${LOCAL_FILE}" \
+                    --arg file_name "${FILE_NAME}" \
+                    '{chat_id: ($chat_id | tonumber), from: $from, text: "", file_path: $file_path, file_name: $file_name, date: $date, type: "audio"}'
+            else
+                rm -f "${LOCAL_FILE}"
+                jq -nc \
+                    --arg chat_id "${CHAT_ID_VAL}" \
+                    --arg from "${FROM_VAL}" \
+                    --argjson date "${DATE_VAL}" \
+                    '{chat_id: ($chat_id | tonumber), from: $from, text: "[audio download failed — will retry]", date: $date, type: "download_error"}'
+            fi
         fi
     done < <(echo "${MESSAGES}" | jq -c '.[] | select(.message.audio) | {
         chat_id: .message.chat.id,
@@ -190,14 +213,21 @@ if [[ "${MSG_COUNT}" -gt 0 ]]; then
 
         if [[ -n "${FILE_PATH}" ]]; then
             LOCAL_FILE="${IMAGE_DIR}/voice_${DATE_VAL}.ogg"
-            telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null || true
-
-            jq -nc \
-                --arg chat_id "${CHAT_ID_VAL}" \
-                --arg from "${FROM_VAL}" \
-                --argjson date "${DATE_VAL}" \
-                --arg file_path "${LOCAL_FILE}" \
-                '{chat_id: ($chat_id | tonumber), from: $from, text: "", file_path: $file_path, date: $date, type: "voice"}'
+            if telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null && [[ -s "${LOCAL_FILE}" ]]; then
+                jq -nc \
+                    --arg chat_id "${CHAT_ID_VAL}" \
+                    --arg from "${FROM_VAL}" \
+                    --argjson date "${DATE_VAL}" \
+                    --arg file_path "${LOCAL_FILE}" \
+                    '{chat_id: ($chat_id | tonumber), from: $from, text: "", file_path: $file_path, date: $date, type: "voice"}'
+            else
+                rm -f "${LOCAL_FILE}"
+                jq -nc \
+                    --arg chat_id "${CHAT_ID_VAL}" \
+                    --arg from "${FROM_VAL}" \
+                    --argjson date "${DATE_VAL}" \
+                    '{chat_id: ($chat_id | tonumber), from: $from, text: "[voice download failed — will retry]", date: $date, type: "download_error"}'
+            fi
         fi
     done < <(echo "${MESSAGES}" | jq -c '.[] | select(.message.voice) | {
         chat_id: .message.chat.id,
@@ -218,14 +248,21 @@ if [[ "${MSG_COUNT}" -gt 0 ]]; then
 
         if [[ -n "${FILE_PATH}" ]]; then
             LOCAL_FILE="${IMAGE_DIR}/videonote_${DATE_VAL}.mp4"
-            telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null || true
-
-            jq -nc \
-                --arg chat_id "${CHAT_ID_VAL}" \
-                --arg from "${FROM_VAL}" \
-                --argjson date "${DATE_VAL}" \
-                --arg file_path "${LOCAL_FILE}" \
-                '{chat_id: ($chat_id | tonumber), from: $from, text: "", file_path: $file_path, date: $date, type: "video_note"}'
+            if telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null && [[ -s "${LOCAL_FILE}" ]]; then
+                jq -nc \
+                    --arg chat_id "${CHAT_ID_VAL}" \
+                    --arg from "${FROM_VAL}" \
+                    --argjson date "${DATE_VAL}" \
+                    --arg file_path "${LOCAL_FILE}" \
+                    '{chat_id: ($chat_id | tonumber), from: $from, text: "", file_path: $file_path, date: $date, type: "video_note"}'
+            else
+                rm -f "${LOCAL_FILE}"
+                jq -nc \
+                    --arg chat_id "${CHAT_ID_VAL}" \
+                    --arg from "${FROM_VAL}" \
+                    --argjson date "${DATE_VAL}" \
+                    '{chat_id: ($chat_id | tonumber), from: $from, text: "[video note download failed — will retry]", date: $date, type: "download_error"}'
+            fi
         fi
     done < <(echo "${MESSAGES}" | jq -c '.[] | select(.message.video_note) | {
         chat_id: .message.chat.id,

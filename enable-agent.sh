@@ -67,6 +67,32 @@ if [[ "${RESTART}" == "true" ]]; then
     exit 0
 fi
 
+# --- Token conflict detection ---
+# Prevent two enabled agents from polling the same Telegram bot token,
+# which causes duplicate message processing and disconnections.
+ENV_FILE_CHECK="${AGENT_DIR}/.env"
+if [[ -f "${ENV_FILE_CHECK}" ]]; then
+    THIS_TOKEN=$(grep '^BOT_TOKEN=' "${ENV_FILE_CHECK}" 2>/dev/null | cut -d= -f2)
+    if [[ -n "${THIS_TOKEN}" ]]; then
+        for other_dir in "${TEMPLATE_ROOT}/agents"/*/; do
+            other=$(basename "$other_dir")
+            [[ "$other" == "$AGENT" || "$other" == "agent-template" ]] && continue
+            other_enabled=$(jq -r ".\"${other}\".enabled // false" "${ENABLED_FILE}" 2>/dev/null || echo "false")
+            [[ "$other_enabled" != "true" ]] && continue
+            other_token=$(grep '^BOT_TOKEN=' "${other_dir}/.env" 2>/dev/null | cut -d= -f2)
+            if [[ "$other_token" == "$THIS_TOKEN" ]]; then
+                echo "ERROR: Agent '${other}' is already enabled with the same BOT_TOKEN."
+                echo "Two agents polling the same token causes message duplication and disconnections."
+                echo ""
+                echo "Options:"
+                echo "  1. Disable the other agent: ./disable-agent.sh ${other}"
+                echo "  2. Create a new bot via @BotFather and use a different token"
+                exit 1
+            fi
+        done
+    fi
+fi
+
 # Set environment for the agent
 export CRM_AGENT_NAME="${AGENT}"
 export CRM_INSTANCE_ID="${CRM_INSTANCE_ID}"

@@ -9,13 +9,23 @@
 #   RESPONSE=$(telegram_api_get "getUpdates?offset=0&timeout=5")
 #   telegram_file_download "photos/file_123.jpg" /tmp/photo.jpg
 
+# Shared curl timeouts: fail fast instead of hanging the poll loop.
+# --connect-timeout: max seconds for TCP connection establishment
+# --max-time: hard ceiling for the entire request (including transfer)
+_TG_CONNECT_TIMEOUT=10
+_TG_MAX_TIME=30
+_TG_DOWNLOAD_MAX_TIME=60  # file downloads get more time
+
 # POST to a Telegram Bot API method
 # Usage: telegram_api_post <method> [curl_args...]
 telegram_api_post() {
     local method="$1"; shift
     (
         set +x  # prevent trace from leaking token in URL
-        curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/${method}" "$@"
+        curl -s -X POST \
+            --connect-timeout ${_TG_CONNECT_TIMEOUT} \
+            --max-time ${_TG_MAX_TIME} \
+            "https://api.telegram.org/bot${BOT_TOKEN}/${method}" "$@"
     )
 }
 
@@ -25,7 +35,10 @@ telegram_api_get() {
     local path="$1"; shift
     (
         set +x
-        curl -s "https://api.telegram.org/bot${BOT_TOKEN}/${path}" "$@"
+        curl -s \
+            --connect-timeout ${_TG_CONNECT_TIMEOUT} \
+            --max-time ${_TG_MAX_TIME} \
+            "https://api.telegram.org/bot${BOT_TOKEN}/${path}" "$@"
     )
 }
 
@@ -36,6 +49,10 @@ telegram_file_download() {
     local output="$2"
     (
         set +x
-        curl -s "https://api.telegram.org/file/bot${BOT_TOKEN}/${file_path}" -o "${output}"
+        curl -s \
+            --connect-timeout ${_TG_CONNECT_TIMEOUT} \
+            --max-time ${_TG_DOWNLOAD_MAX_TIME} \
+            -f \
+            "https://api.telegram.org/file/bot${BOT_TOKEN}/${file_path}" -o "${output}"
     )
 }

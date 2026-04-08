@@ -27,9 +27,13 @@ echo ""
 MISSING=""
 command -v git >/dev/null 2>&1 || MISSING="${MISSING} git"
 command -v claude >/dev/null 2>&1 || MISSING="${MISSING} claude"
+command -v jq >/dev/null 2>&1 || MISSING="${MISSING} jq"
+command -v tmux >/dev/null 2>&1 || MISSING="${MISSING} tmux"
 if [[ -n "$MISSING" ]]; then
     echo "ERROR: Missing required dependencies:${MISSING}"
     [[ "$MISSING" == *"claude"* ]] && echo "  claude: https://docs.anthropic.com/en/docs/claude-code"
+    [[ "$MISSING" == *"jq"* ]] && echo "  jq: brew install jq"
+    [[ "$MISSING" == *"tmux"* ]] && echo "  tmux: brew install tmux"
     exit 1
 fi
 

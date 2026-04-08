@@ -91,11 +91,26 @@ else
         -d parse_mode="Markdown")
 fi
 
-# Check success
+# Check success — if Markdown parse failed, retry without parse_mode
 if echo "${RESPONSE}" | jq -e '.ok' > /dev/null 2>&1; then
     echo "${RESPONSE}" | jq -r '.result.message_id'
 else
-    echo "ERROR: Failed to send message" >&2
-    echo "${RESPONSE}" | jq -r '.description // "Unknown error"' >&2
-    exit 1
+    # Markdown failures (Bad Request) are recoverable — resend as plain text
+    ERROR_DESC=$(echo "${RESPONSE}" | jq -r '.description // ""' 2>/dev/null)
+    if [[ "$ERROR_DESC" == *"can't parse"* || "$ERROR_DESC" == *"Bad Request"* ]]; then
+        RESPONSE=$(telegram_api_post "sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}")
+        if echo "${RESPONSE}" | jq -e '.ok' > /dev/null 2>&1; then
+            echo "${RESPONSE}" | jq -r '.result.message_id'
+        else
+            echo "ERROR: Failed to send message (plain text fallback)" >&2
+            echo "${RESPONSE}" | jq -r '.description // "Unknown error"' >&2
+            exit 1
+        fi
+    else
+        echo "ERROR: Failed to send message" >&2
+        echo "${ERROR_DESC:-Unknown error}" >&2
+        exit 1
+    fi
 fi

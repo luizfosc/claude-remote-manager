@@ -388,12 +388,18 @@ while true; do
         if [[ "$SHOULD_RESTART" == "true" ]]; then
             log "CONTEXT_THRESHOLD: ${RESTART_REASON} — triggering hard-restart"
             CONTEXT_RESTART_TRIGGERED=true
-            inject_messages "SYSTEM: Context threshold reached (${RESTART_REASON}). Before restarting: 1) Write a handoff file to ${CRM_ROOT}/state/${AGENT}.handoff.md with current tasks, briefings sent today, open threads, and in-progress work. 2) Notify Josh via Telegram you're restarting. 3) Run: bash ../../core/bus/hard-restart.sh --reason '${RESTART_REASON}'"
+            # Use a filesystem marker so the safety net subshell can observe changes
+            CONTEXT_RESTART_MARKER="${CRM_ROOT}/state/${AGENT}.context-restart-pending"
+            touch "$CONTEXT_RESTART_MARKER"
+            inject_messages "SYSTEM: Context threshold reached (${RESTART_REASON}). Before restarting: 1) Write a handoff file to ${CRM_ROOT}/state/${AGENT}.handoff.md with current tasks, briefings sent today, open threads, and in-progress work. 2) Notify the user via Telegram you're restarting. 3) Run: bash ../../core/bus/hard-restart.sh --reason '${RESTART_REASON}'"
             rm -f "${SESSION_START_FILE}"
-            # Safety net: if Claude doesn't self-restart within 3 min, force it
-            ( sleep 180; if [[ "$CONTEXT_RESTART_TRIGGERED" == "true" ]]; then
-                log "CONTEXT_THRESHOLD: Claude did not self-restart in 3min — forcing hard-restart"
-                do_hard_restart "forced: context threshold not acted on (${RESTART_REASON})"
+            # Safety net: if Claude doesn't self-restart within 3 min, force it.
+            # Uses a file marker (not a bash variable) so the subshell can observe
+            # whether hard-restart.sh already ran and cleared the marker.
+            ( sleep 180; if [[ -f "${CRM_ROOT}/state/${AGENT}.context-restart-pending" ]]; then
+                echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [fast-checker/${AGENT}] CONTEXT_THRESHOLD: Claude did not self-restart in 3min — forcing hard-restart" >> "$LOG_FILE"
+                rm -f "${CRM_ROOT}/state/${AGENT}.context-restart-pending"
+                bash "${BUS_DIR}/hard-restart.sh" --reason "forced: context threshold not acted on (${RESTART_REASON})" &
             fi ) &
         fi
     fi
@@ -420,11 +426,18 @@ while true; do
     TG_OFFSET_FILE=$(mktemp /tmp/crm-tg-offset-XXXXXX 2>/dev/null || echo "/tmp/crm-tg-offset-$$")
     TG_OUTPUT=$(bash "${BUS_DIR}/check-telegram.sh" 3>"$TG_OFFSET_FILE" 2>/dev/null || echo "")
     TG_NEW_OFFSET=""
+    TG_HAS_DOWNLOAD_ERROR=false
     if [[ -f "$TG_OFFSET_FILE" ]]; then
         TG_NEW_OFFSET=$(grep '__OFFSET__:' "$TG_OFFSET_FILE" 2>/dev/null | sed 's/__OFFSET__://' || true)
         rm -f "$TG_OFFSET_FILE"
     fi
     if [[ -n "$TG_OUTPUT" ]]; then
+        # Check for download errors — if any media failed, don't commit offset
+        if echo "$TG_OUTPUT" | grep -q '"type":"download_error"'; then
+            TG_HAS_DOWNLOAD_ERROR=true
+            log "Download error detected — offset will NOT be committed for retry"
+            TG_NEW_OFFSET=""  # prevent offset commit so failed downloads are retried
+        fi
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
             TYPE=$(echo "$line" | jq -r '.type // "message"' 2>/dev/null || echo "message")
