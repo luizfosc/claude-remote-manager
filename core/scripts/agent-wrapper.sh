@@ -181,7 +181,8 @@ cd "${LAUNCH_DIR}"
 # Determine start mode
 # Check if there's actually a conversation to continue by looking for .jsonl files
 # in Claude's project conversation directory (based on the actual launch directory).
-CONV_DIR="${HOME}/.claude/projects/-$(echo "${LAUNCH_DIR}" | tr '/' '-')"
+# Claude Code slugifies the project path: strip leading /, replace / and _ with -
+CONV_DIR="${HOME}/.claude/projects/-$(echo "${LAUNCH_DIR}" | sed 's|^/||' | tr '/' '-' | tr '_' '-')"
 HAS_CONVERSATION=false
 if [[ -d "${CONV_DIR}" ]] && ls "${CONV_DIR}"/*.jsonl &>/dev/null; then
     HAS_CONVERSATION=true

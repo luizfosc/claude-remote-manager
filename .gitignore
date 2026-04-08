@@ -12,3 +12,6 @@ agents/*/telegram-images/
 # Exclude live agent configs (contain user-specific data)
 agents/*/memory/
 agents/jimbo/
+agents/claudecode_fosc/
+agents/claudecode_fosc_bot/
+.claude/settings.local.json
