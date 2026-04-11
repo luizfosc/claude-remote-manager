@@ -96,13 +96,41 @@ HUMAN_MSG_CHAT_ID=""
 TYPING_LAST_SENT=0
 HUMAN_MSG_PENDING_SINCE=0  # timestamp when last human msg arrived
 
-FROZEN_SOFT_NUDGE_SECONDS=120   # soft nudge (Ctrl+C + re-prompt) after 2 min
-FROZEN_RESTART_MAX_SECONDS=300  # hard-restart if agent busy for 5+ min with pending human msg
+# Frozen-detection thresholds — read from config.json with the upstream
+# defaults (120s soft nudge, 300s hard-restart) preserved as fallback. The
+# `// fallback` syntax in jq means: if the key is absent, use the default.
+FROZEN_SOFT_NUDGE_SECONDS=$(jq -r '.frozen_soft_nudge_seconds // 120' "${AGENT_DIR}/config.json" 2>/dev/null || echo "120")
+FROZEN_RESTART_MAX_SECONDS=$(jq -r '.frozen_restart_max_seconds // 300' "${AGENT_DIR}/config.json" 2>/dev/null || echo "300")
+# Treat <= 0 (or non-numeric strings, which bash promotes to 0) as "disabled".
+# Without this guard a config of 0 / "off" would make the soft nudge or
+# hard-restart fire on every poll once the pane is briefly stale.
+FROZEN_SOFT_NUDGE_DISABLED=false
+if [[ "${FROZEN_SOFT_NUDGE_SECONDS}" -le 0 ]]; then
+    FROZEN_SOFT_NUDGE_SECONDS=0
+    FROZEN_SOFT_NUDGE_DISABLED=true
+    log "frozen soft nudge DISABLED by config (frozen_soft_nudge_seconds <= 0)"
+fi
+FROZEN_RESTART_DISABLED=false
+if [[ "${FROZEN_RESTART_MAX_SECONDS}" -le 0 ]]; then
+    FROZEN_RESTART_MAX_SECONDS=0
+    FROZEN_RESTART_DISABLED=true
+    log "frozen hard-restart DISABLED by config (frozen_restart_max_seconds <= 0)"
+fi
 FROZEN_NUDGE_SENT=0             # track whether we already sent a soft nudge (0=no, 1=yes)
 LAST_PANE_HASH=""               # track pane content changes for progress detection
 PANE_STALE_SINCE=0              # when pane content stopped changing
 PANE_UNCHANGED_SINCE=0         # for passive frozen detection
-PASSIVE_FROZEN_THRESHOLD=600   # 10 min of zero pane change while busy = frozen
+PASSIVE_FROZEN_THRESHOLD=$(jq -r '.passive_frozen_threshold // 1800' "${AGENT_DIR}/config.json" 2>/dev/null || echo "1800")   # 30 min default; configurable
+# Treat <= 0 as "disabled" (the watchdog never triggers passive frozen).
+# Without this guard a config of 0 would make STALE_DURATION >= 0 fire on
+# every poll cycle and put the agent into a hard-restart loop.
+if [[ "${PASSIVE_FROZEN_THRESHOLD}" -le 0 ]]; then
+    PASSIVE_FROZEN_THRESHOLD=0
+    PASSIVE_FROZEN_DISABLED=true
+    log "passive frozen watchdog DISABLED by config (passive_frozen_threshold <= 0)"
+else
+    PASSIVE_FROZEN_DISABLED=false
+fi
 PASSIVE_FROZEN_TRIGGERED=false
 
 # Live activity streaming state
@@ -644,7 +672,16 @@ Reply using: bash ../../core/bus/send-telegram.sh ${CHAT_ID} \"<your reply>\"
             elif [[ "$TYPE" == "voice" || "$TYPE" == "audio" ]]; then
                 AUDIO_PATH=$(echo "$line" | jq -r '.file_path // ""' 2>/dev/null || echo "")
                 AUDIO_NAME=$(echo "$line" | jq -r '.file_name // ""' 2>/dev/null || echo "")
-                MESSAGE_BLOCK+="=== TELEGRAM ${TYPE^^} from ${FROM} (chat_id:${CHAT_ID}) ===
+                # Static case statement instead of bash 4+ uppercase parameter
+                # expansion. macOS ships /bin/bash 3.2 which crashes with
+                # "bad substitution" on that idiom. The set of TYPEs reaching
+                # this branch is fixed by the elif guard above ("voice", "audio").
+                case "$TYPE" in
+                    voice) TYPE_UPPER="VOICE" ;;
+                    audio) TYPE_UPPER="AUDIO" ;;
+                    *)     TYPE_UPPER="MEDIA" ;;
+                esac
+                MESSAGE_BLOCK+="=== TELEGRAM ${TYPE_UPPER} from ${FROM} (chat_id:${CHAT_ID}) ===
 local_file: ${AUDIO_PATH}
 file_name: ${AUDIO_NAME}
 Reply using: bash ../../core/bus/send-telegram.sh ${CHAT_ID} \"<your reply>\"
@@ -800,7 +837,7 @@ Reply using: bash ../../core/bus/send-message.sh ${FROM} normal '<your reply>' $
             STALE_AGE=$(( NOW_TS - PANE_STALE_SINCE ))
 
             # Stage 1: Soft nudge — only if pane stale for 2+ min (no tool output changing)
-            if (( PANE_STALE_SINCE > 0 && STALE_AGE >= FROZEN_SOFT_NUDGE_SECONDS && FROZEN_NUDGE_SENT == 0 )); then
+            if [[ "$FROZEN_SOFT_NUDGE_DISABLED" != "true" ]] && (( PANE_STALE_SINCE > 0 && STALE_AGE >= FROZEN_SOFT_NUDGE_SECONDS && FROZEN_NUDGE_SENT == 0 )); then
                 log "FROZEN NUDGE: pane stale for ${STALE_AGE}s — sending Ctrl+C and re-prompt"
                 FROZEN_NUDGE_SENT=1
                 tmux send-keys -t "${TMUX_SESSION}:0.0" C-c
@@ -810,7 +847,7 @@ Reply using: bash ../../core/bus/send-message.sh ${FROM} normal '<your reply>' $
             fi
 
             # Stage 2: Hard restart — only if stale for 5+ min (nudge didn't help)
-            if (( PANE_STALE_SINCE > 0 && STALE_AGE >= FROZEN_RESTART_MAX_SECONDS )); then
+            if [[ "$FROZEN_RESTART_DISABLED" != "true" ]] && (( PANE_STALE_SINCE > 0 && STALE_AGE >= FROZEN_RESTART_MAX_SECONDS )); then
                 log "FROZEN DETECTED: pane stale for ${STALE_AGE}s — hard-restarting"
                 telegram_api_post "sendMessage" \
                     -H "Content-Type: application/json" \
@@ -842,7 +879,7 @@ Reply using: bash ../../core/bus/send-message.sh ${FROM} normal '<your reply>' $
             LAST_PANE_HASH="$CURRENT_PANE_HASH"
             PANE_UNCHANGED_SINCE=$NOW_TS
             PASSIVE_FROZEN_TRIGGERED=false
-        elif [[ "$PASSIVE_FROZEN_TRIGGERED" == "false" ]] && (( PANE_UNCHANGED_SINCE > 0 )); then
+        elif [[ "$PASSIVE_FROZEN_DISABLED" != "true" ]] && [[ "$PASSIVE_FROZEN_TRIGGERED" == "false" ]] && (( PANE_UNCHANGED_SINCE > 0 )); then
             STALE_DURATION=$(( NOW_TS - PANE_UNCHANGED_SINCE ))
             if ! is_agent_idle && (( STALE_DURATION >= PASSIVE_FROZEN_THRESHOLD )); then
                 log "PASSIVE FROZEN: pane unchanged for ${STALE_DURATION}s while agent busy — hard-restarting"
