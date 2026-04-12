@@ -23,6 +23,7 @@ SCRIPTS=(
     "${REPO_ROOT}/core/scripts/fast-checker.sh"
     "${REPO_ROOT}/core/scripts/register-telegram-commands.sh"
     "${REPO_ROOT}/core/scripts/agent-wrapper.sh"
+    "${REPO_ROOT}/core/scripts/health-check.sh"
 )
 
 FAIL=0
